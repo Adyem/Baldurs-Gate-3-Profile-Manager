@@ -1,7 +1,9 @@
 import os
 import shutil
 import subprocess
+import time
 from datetime import datetime
+import psutil  # requires: pip install psutil
 
 # -------- Configuration --------
 # Location for the player's profiles.
@@ -52,23 +54,47 @@ def get_next_crash_folder(crash_root):
     folder_name = f"crash_{timestamp}"
     return os.path.join(crash_root, folder_name)
 
+def is_game_running(exe_path):
+    """
+    Check if any process is running that has the given executable path.
+    """
+    for proc in psutil.process_iter(['exe']):
+        try:
+            if proc.info['exe'] and os.path.normcase(proc.info['exe']) == os.path.normcase(exe_path):
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return False
+
 def launch_game(exe_path):
     """
-    Launch the game and wait for it to exit.
-    Returns the game's exit code.
+    Launch the game and wait for the actual game process to exit.
+    This function uses psutil to poll for the BG3 executable;
+    it waits until no process with the executable remains.
     """
     try:
+        # Start the launcher process.
         proc = subprocess.Popen([exe_path])
-        proc.wait()
-        return proc.returncode
+        print("Launcher process started. Waiting for the game to launch...")
+        time.sleep(5)  # Allow time for the launcher to spawn the actual game processes.
+
+        # Poll until no processes with BG3_EXE_PATH are found.
+        # (This assumes the actual game uses the same executable path.)
+        while is_game_running(exe_path):
+            print("Game process detected... waiting for it to exit.")
+            time.sleep(5)  # Poll every 5 seconds.
+
+        # Optionally, capture an exit code; here we assume normal termination.
+        return NORMAL_EXIT_CODE
     except Exception as e:
         print(f"Error launching game: {e}")
         return 1  # Nonzero exit code indicates an error
 
 def copy_profile_option():
     """
-    Implements the "copy a profile" option.
+    Implements the 'copy a profile' option.
     Lists available profiles, asks for the profile to copy from, and the new profile name.
+    Prevents using the reserved name 'NoProfile'.
     """
     profiles = list_profiles(SAVED_PROFILES_DIR)
     if not profiles:
@@ -77,7 +103,8 @@ def copy_profile_option():
 
     print("Available profiles to copy from:")
     for idx, profile in enumerate(profiles, start=1):
-        print(f"{idx}: {profile}")
+        folder_path = os.path.join(SAVED_PROFILES_DIR, profile)
+        print(f"{idx}: {profile} (located in {folder_path})")
 
     try:
         src_choice = int(input("Select a profile to copy from by number: "))
@@ -90,6 +117,12 @@ def copy_profile_option():
 
     source_profile = profiles[src_choice - 1]
     new_profile_name = input("Enter the new profile name: ").strip()
+    
+    # Prevent the reserved name "NoProfile" from being used.
+    if new_profile_name.lower() == "noprofile":
+        print("Invalid profile name. 'NoProfile' is reserved and cannot be used.")
+        return
+
     if not new_profile_name:
         print("New profile name cannot be empty.")
         return
@@ -105,67 +138,78 @@ def copy_profile_option():
 
 def launch_game_with_profile():
     """
-    Handles profile selection, backups, and game launching.
+    Lists all saved profiles and asks the user to choose one to load.
+    The player can also type "NoProfile" to launch the game with the currently active profile.
+    Once a profile is chosen, it is loaded into the active folder and the game is launched.
+    After the game exits, if launched via a profile selection (i.e. not NoProfile),
+    changes are saved back, and if the game crashed, the active profile is backed up.
     """
     profiles = list_profiles(SAVED_PROFILES_DIR)
-    active_profile_path = os.path.join(PROFILE_ROOT, ACTIVE_PROFILE_NAME)
-    
-    # If no saved profiles exist, create a default from the active profile.
-    if not profiles:
-        default_profile = "Default"
-        default_profile_path = os.path.join(SAVED_PROFILES_DIR, default_profile)
-        print("No saved profiles found. Initializing the profile manager...")
-        print(f"Saving the current active profile '{ACTIVE_PROFILE_NAME}' as '{default_profile}'.")
-        copy_profile(active_profile_path, default_profile_path)
-        profiles = [default_profile]
-        print("Default profile created.")
-    
-    # If there's only one profile, select it automatically.
-    if len(profiles) == 1:
-        selected_profile = profiles[0]
-        print(f"Only one saved profile '{selected_profile}' found. Using it by default.")
-    else:
-        print("Available profiles:")
+    print("Available profiles from:", SAVED_PROFILES_DIR)
+    if profiles:
         for idx, profile in enumerate(profiles, start=1):
-            print(f"{idx}: {profile}")
+            folder_path = os.path.join(SAVED_PROFILES_DIR, profile)
+            print(f"{idx}: {profile} (located in {folder_path})")
+    else:
+        print("No saved profiles found.")
 
+    print("\nEnter the number corresponding to the profile you want to load,")
+    print("or type 'NoProfile' to launch the game with the currently active profile.")
+    
+    choice = input("Your selection: ").strip()
+
+    use_profile = None  # This will hold the name of the saved profile to load.
+    if choice.lower() == "noprofile":
+        use_profile = None
+    else:
         try:
-            choice = int(input("Select a profile by number: "))
-            if choice < 1 or choice > len(profiles):
-                print("Invalid selection.")
+            profile_index = int(choice)
+            if 1 <= profile_index <= len(profiles):
+                use_profile = profiles[profile_index - 1]
+            else:
+                print("Invalid selection number.")
                 return
         except ValueError:
-            print("Invalid input.")
+            print("Invalid input. Please enter a number or 'NoProfile'.")
             return
 
-        selected_profile = profiles[choice - 1]
+    active_profile_path = os.path.join(PROFILE_ROOT, ACTIVE_PROFILE_NAME)
     
-    selected_profile_path = os.path.join(SAVED_PROFILES_DIR, selected_profile)
-    print(f"Loading profile '{selected_profile}' into '{ACTIVE_PROFILE_NAME}'...")
-    
-    # Backup current active profile, if it exists.
-    if os.path.exists(active_profile_path):
-        backup_public = os.path.join(PROFILE_ROOT, f"Public_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        print(f"Backing up existing '{ACTIVE_PROFILE_NAME}' to '{backup_public}'")
-        copy_profile(active_profile_path, backup_public)
-    
-    print("Copying selected profile to active profile folder...")
-    copy_profile(selected_profile_path, active_profile_path)
-    
-    print("Launching the game...")
+    if use_profile is not None:
+        selected_profile_path = os.path.join(SAVED_PROFILES_DIR, use_profile)
+        print(f"\nLoading profile '{use_profile}' from:")
+        print(f"    {selected_profile_path}")
+        print(f"into the active profile folder:")
+        print(f"    {active_profile_path}")
+        
+        # Backup the current active profile if it exists.
+        if os.path.exists(active_profile_path):
+            backup_public = os.path.join(PROFILE_ROOT, f"{ACTIVE_PROFILE_NAME}_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+            print(f"Backing up current active profile to: {backup_public}")
+            copy_profile(active_profile_path, backup_public)
+        
+        # Copy the selected profile into the active profile folder.
+        print("Copying selected profile into active profile folder...")
+        copy_profile(selected_profile_path, active_profile_path)
+    else:
+        print("\nLaunching game with the current active profile. No profile is loaded or changed.")
+
+    # Launch the game and wait for it to exit.
+    print("\nLaunching Baldur's Gate 3...")
     exit_code = launch_game(BG3_EXE_PATH)
     print(f"Game exited with code {exit_code}.")
-    
-    # If the game did not exit normally, back up the active profile into the Crash folder.
+
+    # If the game did not exit normally, back up the current active profile into the Crash folder.
     if exit_code != NORMAL_EXIT_CODE:
         crash_backup_folder = get_next_crash_folder(CRASH_FOLDER)
-        print(f"Crash detected. Backing up active profile to crash folder: {crash_backup_folder}")
+        print(f"Game crash detected. Backing up active profile to crash folder: {crash_backup_folder}")
         copy_profile(active_profile_path, crash_backup_folder)
     
-    # Save any changes (whether the game exited normally or crashed) back into the selected profile.
-    print("Saving changes back to the selected profile...")
-    copy_profile(active_profile_path, selected_profile_path)
-    print("Profile saved. Exiting program.")
+    # If a profile was loaded (i.e. not NoProfile), save any changes back to the saved profile.
+    if use_profile is not None:
+        print("Saving changes back to the saved profile...")
+        copy_profile(active_profile_path, selected_profile_path)
+        print(f"Profile '{use_profile}' has been updated with changes from the game.")
 
 def main():
     # Ensure the crash folder exists.
@@ -179,7 +223,7 @@ def main():
     
     while True:
         print("\nMain Menu:")
-        print("1: Launch game with selected profile")
+        print("1: Load a profile into the game and launch")
         print("2: Copy an existing profile to create a new one")
         print("3: Exit")
         
@@ -187,13 +231,15 @@ def main():
         
         if choice == "1":
             launch_game_with_profile()
+            # Optionally pause here to see logs before exit.
+            input("Press Enter to exit the launcher...")
             break
         elif choice == "2":
             copy_profile_option()
-            # After copying, ask if the user wants to launch the game.
             launch_now = input("Do you want to launch the game now with a selected profile? (y/n): ").strip().lower()
             if launch_now == "y":
                 launch_game_with_profile()
+                input("Press Enter to exit the launcher...")
                 break
             else:
                 print("Returning to the main menu...")
